@@ -1,0 +1,495 @@
+"""
+Live Wallpaper for Windows
+ - 画像 (PNG/JPG/BMP/WEBP) / GIF / 動画 (MP4 など) を壁紙に設定
+ - デジタル時計 + 日付(月/日/曜日) をオーバーレイ表示
+ - タスクトレイ常駐、設定は自動保存、ログイン時の自動起動に対応
+
+インストール:  pip install PySide6 pywin32
+起動:          python live_wallpaper.py   (コンソール非表示は pythonw live_wallpaper.py)
+exe化:         pip install pyinstaller
+               pyinstaller --noconsole --onefile live_wallpaper.py
+"""
+import sys
+import os
+import json
+import calendar
+import datetime
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QTimer, QUrl, QRect, QObject, Signal
+from PySide6.QtGui import (QImage, QPixmap, QPainter, QColor, QFont, QIcon,
+                           QMovie, QFontMetrics, QAction, QGuiApplication)
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
+from PySide6.QtWidgets import (QApplication, QWidget, QDialog, QFormLayout,
+                               QHBoxLayout, QLineEdit, QPushButton, QComboBox,
+                               QCheckBox, QSlider, QFileDialog, QColorDialog,
+                               QFontComboBox, QSystemTrayIcon, QMenu, QLabel)
+
+import win32api
+import win32con
+import win32gui
+
+APP_NAME = "LiveWallpaper"
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+VIDEO_EXT = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".wmv", ".webm"}
+FIT_MODES = [("画面を埋める (はみ出しカット)", "fill"),
+             ("全体を表示 (余白あり)", "fit"),
+             ("引き伸ばし", "stretch"),
+             ("中央・原寸", "center")]
+POSITIONS = ["左上", "上中央", "右上", "左中央", "中央", "右中央", "左下", "下中央", "右下"]
+
+CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
+CONFIG_PATH = CONFIG_DIR / "config.json"
+DEFAULTS = {
+    "wallpaper": "",
+    "fit": "fill",
+    "show_clock": True,
+    "show_seconds": True,
+    "hour24": True,
+    "lang": "ja",          # ja / en
+    "position": 8,         # 0-8 (POSITIONS)
+    "size": 120,           # 時刻の文字サイズ(px)
+    "color": "#ffffff",
+    "font": "Segoe UI",
+    "autostart": False,
+}
+
+
+# ---------------------------------------------------------------- 設定の保存/読込
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print("設定の保存に失敗:", e)
+
+
+def set_autostart(enabled):
+    import winreg
+    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                         r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
+    try:
+        if enabled:
+            if getattr(sys, "frozen", False):
+                cmd = f'"{sys.executable}"'
+            else:
+                exe = sys.executable
+                pyw = Path(exe).with_name("pythonw.exe")
+                if pyw.exists():
+                    exe = str(pyw)
+                cmd = f'"{exe}" "{Path(__file__).resolve()}"'
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+    finally:
+        winreg.CloseKey(key)
+
+
+# ---------------------------------------------------------------- 壁紙ソース (画像/GIF/動画)
+class WallpaperSource(QObject):
+    changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.image = QImage()
+        self.movie = None
+        self.paused = False
+        # 動画: 1つのプレイヤーのフレームを全モニターで共有する
+        self.player = QMediaPlayer()
+        self.audio = QAudioOutput()
+        self.audio.setMuted(True)
+        self.player.setAudioOutput(self.audio)
+        self.sink = QVideoSink()
+        self.player.setVideoSink(self.sink)
+        self.sink.videoFrameChanged.connect(self._on_video_frame)
+
+    def _on_video_frame(self, frame):
+        if frame.isValid():
+            self.image = frame.toImage()
+            self.changed.emit()
+
+    def _stop(self):
+        self.player.stop()
+        self.player.setSource(QUrl())
+        if self.movie:
+            self.movie.stop()
+            self.movie.deleteLater()
+            self.movie = None
+        self.image = QImage()
+
+    def load(self, path):
+        self._stop()
+        if not path or not os.path.isfile(path):
+            self.changed.emit()
+            return
+        ext = Path(path).suffix.lower()
+        if ext in IMAGE_EXT:
+            self.image = QImage(path)
+        elif ext == ".gif":
+            self.movie = QMovie(path)
+            self.movie.frameChanged.connect(self._on_gif_frame)
+            self.movie.finished.connect(self.movie.start)  # ループ再生
+            self.movie.start()
+            if self.paused:
+                self.movie.setPaused(True)
+        elif ext in VIDEO_EXT:
+            self.player.setSource(QUrl.fromLocalFile(path))
+            self.player.setLoops(QMediaPlayer.Loops.Infinite)
+            if self.paused:
+                self.player.pause()
+            else:
+                self.player.play()
+        self.changed.emit()
+
+    def _on_gif_frame(self, _):
+        if self.movie:
+            self.image = self.movie.currentImage()
+            self.changed.emit()
+
+    def set_paused(self, paused):
+        self.paused = paused
+        if self.movie:
+            self.movie.setPaused(paused)
+        if self.player.source().isValid():
+            self.player.pause() if paused else self.player.play()
+
+
+# ---------------------------------------------------------------- デスクトップ背面に埋め込むウィンドウ
+def find_desktop_parent():
+    """アイコンの背後(WorkerW)のウィンドウハンドルを取得"""
+    progman = win32gui.FindWindow("Progman", None)
+    try:
+        win32gui.SendMessageTimeout(progman, 0x052C, 0, 0, win32con.SMTO_NORMAL, 1000)
+    except Exception:
+        pass
+    found = []
+
+    def cb(hwnd, _):
+        if win32gui.FindWindowEx(hwnd, 0, "SHELLDLL_DefView", None):
+            w = win32gui.FindWindowEx(0, hwnd, "WorkerW", None)
+            if w:
+                found.append(w)
+        return True
+
+    win32gui.EnumWindows(cb, None)
+    # Windows 11 24H2 以降は WorkerW が Progman の子になっている
+    return found[0] if found else progman
+
+
+class WallpaperWindow(QWidget):
+    def __init__(self, ctx, phys_rect):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.Tool)
+        self.ctx = ctx
+        self.phys_rect = phys_rect  # (l, t, r, b) 物理ピクセル
+        self.setAttribute(Qt.WA_NativeWindow)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+        self.show()
+        self.embed()
+
+    def embed(self):
+        hwnd = int(self.winId())
+        parent = find_desktop_parent()
+        win32gui.SetParent(hwnd, parent)
+        l, t, r, b = self.phys_rect
+        cx, cy = win32gui.ScreenToClient(parent, (l, t))
+        win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, cx, cy, r - l, b - t,
+                              win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW)
+
+    # --- 描画
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.fillRect(self.rect(), Qt.black)
+        img = self.ctx.source.image
+        if not img.isNull():
+            p.drawImage(self.target_rect(img.width(), img.height()), img)
+        if self.ctx.cfg["show_clock"]:
+            self.draw_clock(p)
+        p.end()
+
+    def target_rect(self, iw, ih):
+        w, h = self.width(), self.height()
+        mode = self.ctx.cfg["fit"]
+        if mode == "stretch":
+            return QRect(0, 0, w, h)
+        if mode == "center":
+            return QRect((w - iw) // 2, (h - ih) // 2, iw, ih)
+        scale = max(w / iw, h / ih) if mode == "fill" else min(w / iw, h / ih)
+        tw, th = int(iw * scale), int(ih * scale)
+        return QRect((w - tw) // 2, (h - th) // 2, tw, th)
+
+    def draw_clock(self, p):
+        cfg = self.ctx.cfg
+        now = datetime.datetime.now()
+        if cfg["hour24"]:
+            time_text = now.strftime("%H:%M" + (":%S" if cfg["show_seconds"] else ""))
+        else:
+            h12 = now.hour % 12 or 12
+            time_text = f"{h12}:{now.minute:02d}" + (f":{now.second:02d}" if cfg["show_seconds"] else "")
+            time_text += " AM" if now.hour < 12 else " PM"
+        if cfg["lang"] == "ja":
+            date_text = f"{now.month}月{now.day}日 {'月火水木金土日'[now.weekday()]}曜日"
+        else:
+            date_text = f"{calendar.month_name[now.month]} {now.day}  {calendar.day_name[now.weekday()]}"
+
+        size = cfg["size"]
+        f_time = QFont(cfg["font"])
+        f_time.setPixelSize(size)
+        f_time.setWeight(QFont.DemiBold)
+        f_date = QFont(cfg["font"])
+        f_date.setPixelSize(max(12, int(size * 0.38)))
+        fm_t, fm_d = QFontMetrics(f_time), QFontMetrics(f_date)
+        tw, dw = fm_t.horizontalAdvance(time_text), fm_d.horizontalAdvance(date_text)
+        bw = max(tw, dw)
+        bh = fm_t.height() + fm_d.height()
+
+        margin = max(30, int(size * 0.5))
+        col, row = cfg["position"] % 3, cfg["position"] // 3
+        x = [margin, (self.width() - bw) // 2, self.width() - bw - margin][col]
+        y = [margin, (self.height() - bh) // 2, self.height() - bh - margin][row]
+
+        def line_x(w):  # ブロック内の揃え
+            return [x, x + (bw - w) // 2, x + bw - w][col]
+
+        color = QColor(cfg["color"])
+        shadow = QColor(0, 0, 0, 150)
+        for font, fm, text, w, ty in (
+                (f_time, fm_t, time_text, tw, y),
+                (f_date, fm_d, date_text, dw, y + fm_t.height())):
+            p.setFont(font)
+            lx, base = line_x(w), ty + fm.ascent()
+            p.setPen(shadow)
+            p.drawText(lx + 2, base + 2, text)
+            p.setPen(color)
+            p.drawText(lx, base, text)
+
+
+# ---------------------------------------------------------------- 設定ダイアログ
+class SettingsDialog(QDialog):
+    def __init__(self, ctx):
+        super().__init__()
+        self.ctx = ctx
+        self.setWindowTitle("Live壁紙の設定")
+        self.setMinimumWidth(460)
+        cfg = ctx.cfg
+        form = QFormLayout(self)
+
+        # 壁紙
+        self.path_edit = QLineEdit(cfg["wallpaper"])
+        self.path_edit.setReadOnly(True)
+        btn = QPushButton("参照...")
+        btn.clicked.connect(ctx.choose_wallpaper)
+        row = QHBoxLayout()
+        row.addWidget(self.path_edit)
+        row.addWidget(btn)
+        form.addRow("壁紙 (画像/GIF/MP4)", row)
+
+        self.fit = QComboBox()
+        for label, key in FIT_MODES:
+            self.fit.addItem(label, key)
+        self.fit.setCurrentIndex(max(0, self.fit.findData(cfg["fit"])))
+        self.fit.currentIndexChanged.connect(lambda: self.set("fit", self.fit.currentData()))
+        form.addRow("表示方法", self.fit)
+
+        # 時計
+        form.addRow(QLabel("<b>デジタル時計</b>"))
+        form.addRow("時計を表示", self.check("show_clock"))
+        form.addRow("秒を表示", self.check("show_seconds"))
+        form.addRow("24時間表示", self.check("hour24"))
+
+        self.lang = QComboBox()
+        self.lang.addItem("日本語 (10月7日 水曜日)", "ja")
+        self.lang.addItem("English (October 7  Wednesday)", "en")
+        self.lang.setCurrentIndex(max(0, self.lang.findData(cfg["lang"])))
+        self.lang.currentIndexChanged.connect(lambda: self.set("lang", self.lang.currentData()))
+        form.addRow("日付の言語", self.lang)
+
+        self.pos = QComboBox()
+        self.pos.addItems(POSITIONS)
+        self.pos.setCurrentIndex(cfg["position"])
+        self.pos.currentIndexChanged.connect(lambda i: self.set("position", i))
+        form.addRow("表示位置", self.pos)
+
+        self.size = QSlider(Qt.Horizontal)
+        self.size.setRange(40, 360)
+        self.size.setValue(cfg["size"])
+        self.size.valueChanged.connect(lambda v: self.set("size", v))
+        form.addRow("文字サイズ", self.size)
+
+        self.font = QFontComboBox()
+        self.font.setCurrentFont(QFont(cfg["font"]))
+        self.font.currentFontChanged.connect(lambda f: self.set("font", f.family()))
+        form.addRow("フォント", self.font)
+
+        self.color_btn = QPushButton()
+        self.update_color_btn()
+        self.color_btn.clicked.connect(self.pick_color)
+        form.addRow("文字色", self.color_btn)
+
+        form.addRow(QLabel("<b>その他</b>"))
+        auto = self.check("autostart")
+        auto.toggled.connect(set_autostart)
+        form.addRow("Windows起動時に自動実行", auto)
+
+        close = QPushButton("閉じる")
+        close.clicked.connect(self.hide)
+        form.addRow(close)
+
+    def check(self, key):
+        cb = QCheckBox()
+        cb.setChecked(self.ctx.cfg[key])
+        cb.toggled.connect(lambda v: self.set(key, v))
+        return cb
+
+    def set(self, key, value):
+        self.ctx.cfg[key] = value
+        self.ctx.apply()
+
+    def update_color_btn(self):
+        c = self.ctx.cfg["color"]
+        self.color_btn.setText(c)
+        fg = "#000" if QColor(c).lightness() > 128 else "#fff"
+        self.color_btn.setStyleSheet(f"background:{c}; color:{fg}; padding:4px;")
+
+    def pick_color(self):
+        c = QColorDialog.getColor(QColor(self.ctx.cfg["color"]), self, "文字色を選択")
+        if c.isValid():
+            self.set("color", c.name())
+            self.update_color_btn()
+
+
+# ---------------------------------------------------------------- アプリ本体
+class LiveWallpaperApp:
+    def __init__(self, app):
+        self.app = app
+        self.cfg = load_config()
+        self.windows = []
+        self.source = WallpaperSource()
+        self.source.changed.connect(self.repaint_all)
+        self.dialog = None
+
+        self.rebuild_windows()
+        self.source.load(self.cfg["wallpaper"])
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.repaint_all)
+        self.timer.start(500)  # 時計の更新
+
+        app.screenAdded.connect(self.schedule_rebuild)
+        app.screenRemoved.connect(self.schedule_rebuild)
+        self.setup_tray()
+        if not self.cfg["wallpaper"]:
+            QTimer.singleShot(500, self.open_settings)
+
+    def monitor_rects(self):
+        return [rect for (_, _, rect) in win32api.EnumDisplayMonitors()]
+
+    def rebuild_windows(self):
+        for w in self.windows:
+            w.close()
+            w.deleteLater()
+        self.windows = [WallpaperWindow(self, r) for r in self.monitor_rects()]
+
+    def schedule_rebuild(self, *_):
+        QTimer.singleShot(1500, self.rebuild_windows)
+
+    def repaint_all(self):
+        for w in self.windows:
+            w.update()
+
+    def apply(self):
+        save_config(self.cfg)
+        self.repaint_all()
+
+    def choose_wallpaper(self):
+        exts = " ".join(f"*{e}" for e in sorted(IMAGE_EXT | VIDEO_EXT | {".gif"}))
+        path, _ = QFileDialog.getOpenFileName(
+            None, "壁紙を選択", self.cfg["wallpaper"] or str(Path.home() / "Pictures"),
+            f"画像・動画 ({exts});;すべてのファイル (*.*)")
+        if path:
+            self.cfg["wallpaper"] = path
+            self.source.load(path)
+            if self.dialog:
+                self.dialog.path_edit.setText(path)
+            self.apply()
+
+    def open_settings(self):
+        if not self.dialog:
+            self.dialog = SettingsDialog(self)
+        self.dialog.show()
+        self.dialog.raise_()
+        self.dialog.activateWindow()
+
+    def toggle_pause(self):
+        self.source.set_paused(not self.source.paused)
+        self.pause_action.setText("再開" if self.source.paused else "一時停止")
+
+    def quit(self):
+        self.source.player.stop()
+        for w in self.windows:
+            w.close()
+        # 壁紙を元に戻すためデスクトップを再描画
+        win32gui.SystemParametersInfo(win32con.SPI_SETDESKWALLPAPER, "", win32con.SPIF_UPDATEINIFILE)
+        self.app.quit()
+
+    def setup_tray(self):
+        pm = QPixmap(64, 64)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setBrush(QColor("#2b7cff"))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(4, 4, 56, 56, 14, 14)
+        p.setPen(QColor("white"))
+        f = QFont("Segoe UI", 22, QFont.Bold)
+        p.setFont(f)
+        p.drawText(pm.rect(), Qt.AlignCenter, "LW")
+        p.end()
+
+        self.tray = QSystemTrayIcon(QIcon(pm))
+        self.tray.setToolTip("Live壁紙")
+        menu = QMenu()
+        menu.addAction("設定を開く", self.open_settings)
+        menu.addAction("壁紙を選択...", self.choose_wallpaper)
+        self.pause_action = menu.addAction("一時停止", self.toggle_pause)
+        menu.addSeparator()
+        menu.addAction("終了", self.quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda r: self.open_settings() if r == QSystemTrayIcon.DoubleClick else None)
+        self.tray.show()
+        self._menu = menu
+
+
+MUTEX_NAME = "LiveWallpaperSingleInstanceMutex"  # installer.iss の AppMutex と同じ値
+
+
+def main():
+    import win32event
+    import winerror
+    mutex = win32event.CreateMutex(None, False, MUTEX_NAME)  # noqa: F841 (保持が必要)
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        sys.exit(0)  # すでに起動中
+
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationName(APP_NAME)
+    ctx = LiveWallpaperApp(app)  # noqa: F841 (参照を保持)
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
