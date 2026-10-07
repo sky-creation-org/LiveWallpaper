@@ -22,7 +22,7 @@ from PySide6.QtGui import (QImage, QPixmap, QPainter, QColor, QFont, QIcon,
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
 from PySide6.QtWidgets import (QApplication, QWidget, QDialog, QFormLayout,
                                QHBoxLayout, QLineEdit, QPushButton, QComboBox,
-                               QCheckBox, QSlider, QFileDialog, QColorDialog,
+                               QCheckBox, QSlider, QSpinBox, QFileDialog, QColorDialog,
                                QFontComboBox, QSystemTrayIcon, QMenu, QLabel)
 
 import win32api
@@ -52,6 +52,8 @@ DEFAULTS = {
     "color": "#ffffff",
     "font": "Segoe UI",
     "autostart": False,
+    "loop_seconds": 8,     # GIF/動画をループする秒数 (0=全体)
+    "display_mode": "auto",  # auto / 1-5 (手動のライブ表示方式) / static
 }
 
 
@@ -106,6 +108,9 @@ class WallpaperSource(QObject):
         self.image = QImage()
         self.movie = None
         self.paused = False
+        self.loop_ms = 0           # 0 = ループ区間を制限しない
+        self._gif_elapsed = 0
+        self._gif_last_delay = 0
         # 動画: 1つのプレイヤーのフレームを全モニターで共有する
         self.player = QMediaPlayer()
         self.audio = QAudioOutput()
@@ -116,9 +121,15 @@ class WallpaperSource(QObject):
         self.sink.videoFrameChanged.connect(self._on_video_frame)
 
     def _on_video_frame(self, frame):
-        if frame.isValid():
-            self.image = frame.toImage()
-            self.changed.emit()
+        if not frame.isValid():
+            return
+        if self.loop_ms > 0:
+            t = frame.startTime()  # マイクロ秒
+            if t > 0 and t >= self.loop_ms * 1000:
+                self.player.setPosition(0)  # 指定秒数に達したら先頭に戻す
+                return
+        self.image = frame.toImage()
+        self.changed.emit()
 
     def _stop(self):
         self.player.stop()
@@ -140,7 +151,10 @@ class WallpaperSource(QObject):
         elif ext == ".gif":
             self.movie = QMovie(path)
             self.movie.frameChanged.connect(self._on_gif_frame)
-            self.movie.finished.connect(self.movie.start)  # ループ再生
+            self.movie.finished.connect(self.movie.start)  # 全体のループ
+            self.movie.setCacheMode(QMovie.CacheAll)       # 先頭へ戻る処理を軽くする
+            self._gif_elapsed = 0
+            self._gif_last_delay = 0
             self.movie.start()
             if self.paused:
                 self.movie.setPaused(True)
@@ -153,10 +167,20 @@ class WallpaperSource(QObject):
                 self.player.play()
         self.changed.emit()
 
-    def _on_gif_frame(self, _):
-        if self.movie:
-            self.image = self.movie.currentImage()
-            self.changed.emit()
+    def _on_gif_frame(self, n):
+        m = self.movie
+        if not m:
+            return
+        if n == 0:
+            self._gif_elapsed = 0
+        else:
+            self._gif_elapsed += self._gif_last_delay
+        if self.loop_ms > 0 and n != 0 and self._gif_elapsed >= self.loop_ms:
+            m.jumpToFrame(0)  # 指定秒数に達したら先頭に戻す
+            return
+        self._gif_last_delay = max(m.nextFrameDelay(), 10)
+        self.image = m.currentImage()
+        self.changed.emit()
 
     def set_paused(self, paused):
         self.paused = paused
@@ -316,9 +340,10 @@ def looks_visible(rect):
 
 
 class WallpaperWindow(QWidget):
-    def __init__(self, ctx, phys_rect):
+    def __init__(self, ctx, phys_rect, forced=None):
         super().__init__(None, Qt.FramelessWindowHint | Qt.Tool)
         self.ctx = ctx
+        self.forced = forced  # None=自動 / '1'..'5'=手動で方式を指定
         self.phys_rect = phys_rect  # (l, t, r, b) 物理ピクセル
         self.testing = True         # 埋め込みテスト中はマゼンタで塗る
         self.cands = []
@@ -335,6 +360,24 @@ class WallpaperWindow(QWidget):
         except Exception as e:
             log(f"build_candidates failed: {e!r}")
             self.cands = []
+        if self.forced is not None:
+            i = int(self.forced) - 1
+            if 0 <= i < len(self.cands):
+                cand = self.cands[i]
+                try:
+                    apply_candidate(int(self.winId()), cand, self.phys_rect)
+                    log(f"manual strategy {cand[0]} applied")
+                    self.testing = False
+                    self.update()
+                    self.ctx.embed_ok(f"{cand[0]} / 手動")
+                except Exception as e:
+                    log(f"manual strategy failed: {e!r}")
+                    self.testing = False
+                return
+            log(f"manual strategy {self.forced} unavailable -> auto")
+            self.ctx.tray.showMessage("Live Wallpaper", f"方式{self.forced}はこのPCにないため、自動で選びます。",
+                                      QSystemTrayIcon.Information, 4000)
+            self.forced = None
         self.try_next()
 
     def try_next(self):
@@ -386,6 +429,8 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(460)
         cfg = ctx.cfg
         form = QFormLayout(self)
+        self.mode_label = QLabel(f"現在の表示モード: {ctx.mode}")
+        form.addRow(self.mode_label)
 
         # 壁紙
         self.path_edit = QLineEdit(cfg["wallpaper"])
@@ -403,6 +448,13 @@ class SettingsDialog(QDialog):
         self.fit.setCurrentIndex(max(0, self.fit.findData(cfg["fit"])))
         self.fit.currentIndexChanged.connect(lambda: self.set("fit", self.fit.currentData()))
         form.addRow("表示方法", self.fit)
+
+        self.loop = QSpinBox()
+        self.loop.setRange(0, 60)
+        self.loop.setSuffix(" 秒 (0=全体)")
+        self.loop.setValue(cfg["loop_seconds"])
+        self.loop.valueChanged.connect(lambda v: self.set("loop_seconds", v))
+        form.addRow("GIF/動画のループ区間", self.loop)
 
         # 時計
         form.addRow(QLabel("<b>デジタル時計</b>"))
@@ -440,6 +492,15 @@ class SettingsDialog(QDialog):
         form.addRow("文字色", self.color_btn)
 
         form.addRow(QLabel("<b>その他</b>"))
+        self.disp = QComboBox()
+        self.disp.addItem("自動 (推奨)", "auto")
+        for i in range(1, 6):
+            self.disp.addItem(f"ライブ表示 方式{i} (手動)", str(i))
+        self.disp.addItem("静止画モード (動かない・確実)", "static")
+        self.disp.setCurrentIndex(max(0, self.disp.findData(cfg["display_mode"])))
+        self.disp.currentIndexChanged.connect(
+            lambda: self.ctx.change_display_mode(self.disp.currentData()))
+        form.addRow("デスクトップ表示方式", self.disp)
         auto = self.check("autostart")
         auto.toggled.connect(set_autostart)
         form.addRow("Windows起動時に自動実行", auto)
@@ -478,6 +539,7 @@ class LiveWallpaperApp:
         self.cfg = load_config()
         self.windows = []
         self.source = WallpaperSource()
+        self.source.loop_ms = int(self.cfg["loop_seconds"]) * 1000
         self.source.changed.connect(self.repaint_all)
         self.dialog = None
         self.mode = "起動中"
@@ -488,26 +550,34 @@ class LiveWallpaperApp:
         self.notified = False
 
         self.setup_tray()
-        self.rebuild_windows()
         self.source.load(self.cfg["wallpaper"])
+        self.static_timer = QTimer()
+        self.static_timer.timeout.connect(self.render_static)
+        if self.cfg["display_mode"] == "static":
+            self.enter_static_mode()
+            self.maybe_open_settings()
+        else:
+            self.rebuild_windows()
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.repaint_all)
         self.timer.start(500)  # 時計の更新
 
-        self.static_timer = QTimer()
-        self.static_timer.timeout.connect(self.render_static)
-
         app.screenAdded.connect(self.schedule_rebuild)
         app.screenRemoved.connect(self.schedule_rebuild)
 
     # --- 埋め込み結果
+    def set_mode(self, text):
+        self.mode = text
+        self.tray.setToolTip(f"Live壁紙 - {text}")
+        if self.dialog:
+            self.dialog.mode_label.setText(f"現在の表示モード: {text}")
+
     def embed_ok(self, name):
         if self.notified:
             return
         self.notified = True
-        self.mode = f"ライブ表示 ({name})"
-        self.tray.setToolTip(f"Live壁紙 - {self.mode}")
+        self.set_mode(f"ライブ表示 ({name})")
         self.tray.showMessage("Live Wallpaper", "壁紙の表示を開始しました。タスクトレイのアイコンから設定できます。",
                               QSystemTrayIcon.Information, 5000)
         self.maybe_open_settings()
@@ -532,10 +602,11 @@ class LiveWallpaperApp:
             w.close()
             w.deleteLater()
         self.windows = []
-        try:
-            self.original_wallpaper = win32gui.SystemParametersInfo(win32con.SPI_GETDESKWALLPAPER, 260)
-        except Exception:
-            self.original_wallpaper = None
+        if not self.original_wallpaper:
+            try:
+                self.original_wallpaper = win32gui.SystemParametersInfo(win32con.SPI_GETDESKWALLPAPER, 260)
+            except Exception:
+                self.original_wallpaper = None
         try:
             import winreg
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop", 0, winreg.KEY_SET_VALUE)
@@ -544,8 +615,7 @@ class LiveWallpaperApp:
             winreg.CloseKey(key)
         except Exception as e:
             log(f"registry failed {e!r}")
-        self.mode = "静止画モード (1分ごと更新)"
-        self.tray.setToolTip(f"Live壁紙 - {self.mode}")
+        self.set_mode("静止画モード (動画/GIFは動きません)")
         self.tray.showMessage(
             "Live Wallpaper",
             "この環境ではライブ表示ができないため、壁紙+時計を1分ごとに更新する静止画モードで動作します。",
@@ -586,7 +656,9 @@ class LiveWallpaperApp:
             w.close()
             w.deleteLater()
         self.notified = False
-        self.windows = [WallpaperWindow(self, r) for r in self.monitor_rects()]
+        mode = self.cfg["display_mode"]
+        forced = mode if mode not in ("auto", "static") else None
+        self.windows = [WallpaperWindow(self, r, forced) for r in self.monitor_rects()]
 
     def schedule_rebuild(self, *_):
         QTimer.singleShot(1500, self.rebuild_windows)
@@ -598,7 +670,30 @@ class LiveWallpaperApp:
             if not w.testing:
                 w.update()
 
+    def leave_static_mode(self):
+        self.static_mode = False
+        self.static_timer.stop()
+        if self.original_wallpaper:
+            try:
+                win32gui.SystemParametersInfo(
+                    win32con.SPI_SETDESKWALLPAPER, self.original_wallpaper,
+                    win32con.SPIF_UPDATEINIFILE | win32con.SPIF_SENDCHANGE)
+            except Exception:
+                pass
+        self.original_wallpaper = None
+
+    def change_display_mode(self, value):
+        self.cfg["display_mode"] = value
+        save_config(self.cfg)
+        if self.static_mode:
+            self.leave_static_mode()
+        if value == "static":
+            self.enter_static_mode()
+        else:
+            self.rebuild_windows()
+
     def apply(self):
+        self.source.loop_ms = int(self.cfg["loop_seconds"]) * 1000
         save_config(self.cfg)
         self.repaint_all()
         if self.static_mode:
