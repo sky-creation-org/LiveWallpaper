@@ -1,6 +1,6 @@
 ; Inno Setup 6 script  -  Live Wallpaper
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "2.0.0"
 #endif
 
 [Setup]
@@ -21,9 +21,9 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\LiveWallpaper.exe
-; アプリ実行中ならインストーラーが検知して終了を促す
-AppMutex=LiveWallpaperSingleInstanceMutex
-CloseApplications=yes
+; 実行中チェックはしない (トレイ常駐アプリでアンインストールが止まるため)。
+; 代わりに下の [Code] でインストール/アンインストール前にアプリを自動終了する。
+CloseApplications=no
 
 [Languages]
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
@@ -46,5 +46,23 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{app}\LiveWallpaper.exe"; Description: "Live Wallpaper を今すぐ起動"; Flags: nowait postinstall skipifsilent
 
-[UninstallRun]
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM LiveWallpaper.exe"; Flags: runhidden; RunOnceId: "KillLiveWallpaper"
+[Code]
+procedure KillApp();
+var
+  rc: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM LiveWallpaper.exe', '', SW_HIDE, ewWaitUntilTerminated, rc);
+  Sleep(800);
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  KillApp();
+  Result := True;
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  KillApp();
+  Result := True;
+end;
